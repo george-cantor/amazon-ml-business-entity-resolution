@@ -1,0 +1,29 @@
+@"
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Competition data
+data/
+*.tsv
+*.csv
+
+# Generated files
+output/
+outputs/
+experiments/
+results/
+
+# Testing/cache
+.pytest_cache/
+.mypy_cache/
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+"@ | Set-Content .gitignore
