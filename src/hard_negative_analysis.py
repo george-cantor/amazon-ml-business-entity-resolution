@@ -45,6 +45,10 @@ CANDIDATES_PER_S1 = 20
 
 CHUNKSIZE = 200_000
 
+# Safety limit for extremely large blocking groups during this
+# diagnostic experiment. This is NOT the final Phase 2 matching limit.
+MAX_CANDIDATES_PER_BLOCK = 500
+
 
 # ============================================================
 # TEXT NORMALIZATION
@@ -101,6 +105,27 @@ def name_key(name: str) -> str:
 
     return compact[:4]
 
+def name_key_series(series):
+    """
+    Vectorized version of name_key() for pandas Series.
+    """
+    s = (
+        series
+        .fillna("")
+        .astype("string")
+        .str.normalize("NFKC")
+        .str.casefold()
+        .str.replace("&", " and ", regex=False)
+        .str.replace(r"[^\w\s]", " ", regex=True)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
+
+    return (
+        s.str.replace(r"[^\w]", "", regex=True)
+         .str.slice(0, 4)
+         .fillna("")
+    )
 
 def token_set(text: str) -> set[str]:
 
@@ -116,6 +141,20 @@ def jaccard(a: str, b: str) -> float:
 
     A = token_set(a)
     B = token_set(b)
+
+    if not A and not B:
+        return 1.0
+
+    if not A or not B:
+        return 0.0
+
+    return len(A & B) / len(A | B)
+
+
+def jaccard_normalized(a: str, b: str) -> float:
+
+    A = set(a.split()) if a else set()
+    B = set(b.split()) if b else set()
 
     if not A and not B:
         return 1.0
@@ -279,9 +318,8 @@ print(
 # BUILD S1 BLOCKING KEYS
 # ============================================================
 
-s1_df["name_key"] = (
+s1_df["name_key"] = name_key_series(
     s1_df["business_name"]
-    .apply(name_key)
 )
 
 s1_df["country_key"] = (
@@ -294,6 +332,17 @@ s1_df["block_key"] = (
     s1_df["country_key"]
     + "_"
     + s1_df["name_key"]
+)
+
+# Precompute normalized text once for the sampled S1 records.
+s1_df["norm_name"] = (
+    s1_df["business_name"]
+    .map(normalize_text)
+)
+
+s1_df["norm_address"] = (
+    s1_df["business_address"]
+    .map(normalize_text)
 )
 
 
@@ -341,6 +390,16 @@ print(
     f"{len(true_pair_set):,}"
 )
 
+# Fast lookup: S1 ID -> set of known true target IDs.
+# This avoids scanning the full true_pair_set for every candidate.
+true_targets_by_s1 = {}
+
+for sid, target_id in true_pair_set:
+    true_targets_by_s1.setdefault(
+        sid,
+        set()
+    ).add(target_id)
+
 
 # ============================================================
 # CANDIDATE COLLECTION
@@ -369,6 +428,16 @@ def collect_candidates(
 
     total_candidates = 0
 
+    # Build this lookup ONCE. The old implementation rebuilt it
+    # for every input chunk.
+    s1_by_block = {
+        block_key: group
+        for block_key, group in s1_df.groupby(
+            "block_key",
+            sort=False
+        )
+    }
+
     for chunk_number, chunk in enumerate(
         pd.read_csv(
             source_path,
@@ -380,18 +449,23 @@ def collect_candidates(
         start=1
     ):
 
+        print(
+            f"Reading {source_name} chunk "
+            f"{chunk_number:,}...",
+            flush=True
+        )
+
         # --------------------------------------------
         # Construct blocking key
         # --------------------------------------------
 
-        chunk["name_key"] = (
+        chunk["name_key"] = name_key_series(
             chunk["business_name"]
-            .apply(name_key)
         )
 
         chunk["country_key"] = (
             chunk["country"]
-            .astype(str)
+            .astype("string")
             .str.casefold()
         )
 
@@ -405,45 +479,103 @@ def collect_candidates(
             chunk["block_key"].isin(
                 s1_block_keys
             )
-        ]
+        ].copy()
 
         if len(relevant) == 0:
+            if chunk_number % 5 == 0:
+                print(
+                    f"Processed chunk "
+                    f"{chunk_number:,} | "
+                    f"relevant rows: 0 | "
+                    f"candidate pairs retained: "
+                    f"{total_candidates:,}"
+                )
             continue
 
         # --------------------------------------------
-        # Group candidates by blocking key
+        # Precompute normalized candidate fields once
+        # for this relevant subset.
         # --------------------------------------------
 
+        relevant["norm_name"] = (
+            relevant["business_name"]
+            .map(normalize_text)
+        )
+
+        relevant["norm_address"] = (
+            relevant["business_address"]
+            .map(normalize_text)
+        )
+
+        relevant["address_numbers"] = (
+            relevant["business_address"]
+            .map(numeric_tokens)
+        )
+
+        # Group candidates by blocking key
         grouped = relevant.groupby(
-            "block_key"
+            "block_key",
+            sort=False
         )
 
         for block_key, candidate_group in grouped:
 
+            # Very large blocks can make the nested S1 x S2
+            # comparison explode. For this diagnostic experiment,
+            # use a reproducible sample from pathological blocks.
+            original_block_size = len(candidate_group)
+
+            if original_block_size > MAX_CANDIDATES_PER_BLOCK:
+                candidate_group = candidate_group.sample(
+                    n=MAX_CANDIDATES_PER_BLOCK,
+                    random_state=RANDOM_SEED
+                )
+
             # Find S1 records belonging to this block
-            matching_s1 = s1_df[
-                s1_df["block_key"] == block_key
-            ]
+            matching_s1 = s1_by_block.get(
+                block_key
+            )
 
-            for _, s1_row in matching_s1.iterrows():
+            if matching_s1 is None:
+                continue
 
-                s1_id = s1_row["entity_id"]
+            # itertuples() is substantially cheaper than iterrows()
+            # for this inner-loop diagnostic.
+            for s1_row in matching_s1.itertuples(
+                index=False
+            ):
 
-                true_ids = {
-                    target_id
-                    for (
-                        sid,
-                        target_id
-                    ) in true_pair_set
-                    if sid == s1_id
-                }
+                s1_id = s1_row.entity_id
 
-                for _, candidate in (
-                    candidate_group.iterrows()
+                true_ids = true_targets_by_s1.get(
+                    s1_id,
+                    set()
+                )
+
+                s1_name = (
+                    s1_row.business_name
+                )
+
+                s1_address = (
+                    s1_row.business_address
+                )
+
+                s1_country = str(
+                    s1_row.country
+                ).casefold()
+
+                s1_norm_name = s1_row.norm_name
+                s1_norm_address = s1_row.norm_address
+                s1_numbers = numeric_tokens(
+                    s1_address
+                )
+
+                for candidate in candidate_group.itertuples(
+                    index=False
                 ):
 
                     candidate_id = (
-                        candidate["entity_id"]
+                        candidate.entity_id
                     )
 
                     # --------------------------------
@@ -451,11 +583,7 @@ def collect_candidates(
                     # positive examples
                     # --------------------------------
 
-                    if (
-                        s1_id,
-                        candidate_id
-                    ) in true_pair_set:
-
+                    if candidate_id in true_ids:
                         continue
 
                     # --------------------------------
@@ -464,23 +592,25 @@ def collect_candidates(
 
                     if (
                         str(
-                            candidate["country"]
+                            candidate.country
                         ).casefold()
-                        !=
-                        str(
-                            s1_row["country"]
-                        ).casefold()
+                        != s1_country
                     ):
-
                         continue
 
                     # --------------------------------
                     # Calculate name similarity
+                    # using pre-normalized candidate text
                     # --------------------------------
 
-                    name_sim = similarity(
-                        s1_row["business_name"],
-                        candidate["business_name"]
+                    name_sim = (
+                        ratio(
+                            s1_norm_name,
+                            candidate.norm_name
+                        ) / 100.0
+                        if s1_norm_name
+                        and candidate.norm_name
+                        else 0.0
                     )
 
                     # We are interested in difficult
@@ -488,20 +618,59 @@ def collect_candidates(
                     if name_sim < 0.45:
                         continue
 
-                    address_sim = similarity(
-                        s1_row["business_address"],
-                        candidate["business_address"]
+                    # --------------------------------
+                    # Address similarity
+                    # --------------------------------
+
+                    address_sim = (
+                        ratio(
+                            s1_norm_address,
+                            candidate.norm_address
+                        ) / 100.0
+                        if s1_norm_address
+                        and candidate.norm_address
+                        else 0.0
                     )
+
+                    # --------------------------------
+                    # Numeric address overlap
+                    # --------------------------------
+
+                    candidate_numbers = (
+                        candidate.address_numbers
+                    )
+
+                    if (
+                        not s1_numbers
+                        and not candidate_numbers
+                    ):
+                        numeric_overlap_score = 1.0
+
+                    elif (
+                        not s1_numbers
+                        or not candidate_numbers
+                    ):
+                        numeric_overlap_score = 0.0
+
+                    else:
+                        numeric_overlap_score = (
+                            len(
+                                s1_numbers
+                                & candidate_numbers
+                            )
+                            /
+                            len(
+                                s1_numbers
+                                | candidate_numbers
+                            )
+                        )
 
                     score = (
                         0.60 * name_sim
                         +
                         0.30 * address_sim
                         +
-                        0.10 * numeric_overlap(
-                            s1_row["business_address"],
-                            candidate["business_address"]
-                        )
+                        0.10 * numeric_overlap_score
                     )
 
                     candidate_map[s1_id].append(
@@ -513,34 +682,32 @@ def collect_candidates(
                             "name_similarity": name_sim,
                             "address_similarity": address_sim,
 
-                            "name_jaccard": jaccard(
-                                s1_row["business_name"],
-                                candidate["business_name"]
+                            "name_jaccard": jaccard_normalized(
+                                s1_norm_name,
+                                candidate.norm_name
                             ),
 
-                            "address_jaccard": jaccard(
-                                s1_row["business_address"],
-                                candidate["business_address"]
+                             "address_jaccard": jaccard_normalized(
+                                s1_norm_address,
+                                candidate.norm_address
                             ),
 
-                            "numeric_overlap": numeric_overlap(
-                                s1_row["business_address"],
-                                candidate["business_address"]
-                            ),
+                            "numeric_overlap":
+                                numeric_overlap_score,
 
                             "country_same": 1,
 
                             "s1_name":
-                                s1_row["business_name"],
+                                s1_name,
 
                             "candidate_name":
-                                candidate["business_name"],
+                                candidate.business_name,
 
                             "s1_address":
-                                s1_row["business_address"],
+                                s1_address,
 
                             "candidate_address":
-                                candidate["business_address"],
+                                candidate.business_address,
 
                             "ranking_score": score
                         }
@@ -548,12 +715,36 @@ def collect_candidates(
 
                     total_candidates += 1
 
+                # --------------------------------
+                # Keep only the strongest temporary
+                # candidates for each S1.
+                #
+                # The final analysis retains the top
+                # NEGATIVES_PER_S1, so keeping 20 here
+                # is sufficient and prevents memory growth.
+                # --------------------------------
+
+                if len(
+                    candidate_map[s1_id]
+                ) > CANDIDATES_PER_S1:
+
+                    candidate_map[s1_id] = sorted(
+                        candidate_map[s1_id],
+                        key=lambda x:
+                            x["ranking_score"],
+                        reverse=True
+                    )[
+                        :CANDIDATES_PER_S1
+                    ]
+
         if chunk_number % 5 == 0:
 
             print(
                 f"Processed chunk "
                 f"{chunk_number:,} | "
-                f"candidate pairs collected: "
+                f"relevant rows: "
+                f"{len(relevant):,} | "
+                f"candidate pairs retained: "
                 f"{total_candidates:,}"
             )
 
@@ -773,8 +964,7 @@ for _, row in sample_gt.iterrows():
 
         true_records.append(
             {
-                "source1_entity_id":+
-                
+                "source1_entity_id":
                     s1_id,
 
                 "candidate_entity_id":
