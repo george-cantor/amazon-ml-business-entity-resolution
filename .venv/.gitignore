@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data
+data/
+*.tsv
+*.csv
+*.parquet
+
+# Models
+models/
+*.pkl
+*.joblib
+*.model
+
+# Outputs
+output/
+experiments/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# Temporary
+*.tmp
+*.temp
