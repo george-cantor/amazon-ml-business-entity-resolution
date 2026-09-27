@@ -27,3 +27,7 @@ results/
 .DS_Store
 Thumbs.db
 "@ | Set-Content .gitignore
+# Submission artifacts / backups
+Veterans_submission.zip
+submission_package/
+src/submission_backup.py
