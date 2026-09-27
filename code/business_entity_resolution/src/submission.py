@@ -27,9 +27,9 @@ from rapidfuzz.fuzz import ratio
 # 5. Produce and validate both official output files.
 # ============================================================
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 TEST_DIR = ROOT / "data" / "test"
-MODEL_PATH = ROOT / "experiments" / "model" / "logistic_model.joblib"
+MODEL_PATH = ROOT / "code" / "business_entity_resolution" / "models" / "logistic_model.joblib"
 OUTPUT_DIR = ROOT / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -41,8 +41,8 @@ TMP_DIR.mkdir(exist_ok=True)
 # ------------------------------------------------------------
 # TUNABLE LIMITS -- deliberately conservative for Windows.
 # ------------------------------------------------------------
-TOP_K_CANDIDATES = 10
-EXACT_SCORE_K = 10
+TOP_K_CANDIDATES = 8
+EXACT_SCORE_K = 8
 
 # A block is joined only if the complete block cross-product is <= this.
 # This is the key protection against the previous enormous join.
